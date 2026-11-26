@@ -1,0 +1,171 @@
+name: Pacote papel de parede Kyrios
+
+# Monta o pacote que coloca o papel de parede da Igreja Kyrios nos Macs.
+# Rodar em Actions > "Pacote papel de parede Kyrios" > Run workflow,
+# colando o link de download da imagem (PNG 5120x2880 exportado do Canva).
+#
+# Assinatura: a Apple exige pacote assinado com certificado "Developer ID Installer".
+# Cadastre em Settings > Secrets and variables > Actions:
+#   DEVID_INSTALLER_P12       certificado .p12 em base64 (base64 -i cert.p12 | pbcopy)
+#   DEVID_INSTALLER_SENHA     senha do .p12
+#   DEVID_INSTALLER_NOME      ex.: Developer ID Installer: Igreja Evangelica Kyrios (TEAMID)
+# Sem esses secrets o pacote sai SEM assinatura (serve só para teste manual).
+
+on:
+  workflow_dispatch:
+    inputs:
+      imagem_url:
+        description: "Link de download do PNG do papel de parede"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  pacote:
+    runs-on: macos-latest
+    env:
+      PKG_ID: com.igrejakyrios.papeldeparede
+      BASE: /Library/Application Support/Kyrios
+      IMG_DIR: /Library/Desktop Pictures/Kyrios
+    steps:
+      - name: Baixar a imagem
+        env:
+          IMAGEM_URL: ${{ inputs.imagem_url }}
+        run: |
+          mkdir -p work
+          curl -fsSL -o work/kyrios-papel-de-parede.png "$IMAGEM_URL"
+          file work/kyrios-papel-de-parede.png | grep -q "PNG image data" || { echo "O link não é um PNG"; exit 1; }
+          sips -g pixelWidth -g pixelHeight work/kyrios-papel-de-parede.png
+
+      - name: Montar o conteúdo do pacote
+        run: |
+          VERSAO="1.0.${GITHUB_RUN_NUMBER}"
+          echo "VERSAO=$VERSAO" >> "$GITHUB_ENV"
+          ROOT="$PWD/root"
+          APP="$ROOT$BASE/Kyrios Papel de Parede.app"
+          mkdir -p "$APP/Contents/MacOS" "$ROOT$IMG_DIR" "$ROOT/Library/LaunchAgents" scripts
+
+          cp work/kyrios-papel-de-parede.png "$ROOT$IMG_DIR/kyrios-papel-de-parede.png"
+
+          # Programa que aplica a imagem em todas as telas (Intel e Apple Silicon)
+          cat > work/aplicar.swift <<'SWIFT'
+          import AppKit
+          let url = URL(fileURLWithPath: CommandLine.arguments[1])
+          var ok = true
+          for tela in NSScreen.screens {
+              do { try NSWorkspace.shared.setDesktopImageURL(url, for: tela, options: [:]) }
+              catch { ok = false; FileHandle.standardError.write("\(error)\n".data(using: .utf8)!) }
+          }
+          exit(ok ? 0 : 1)
+          SWIFT
+          swiftc -O -target arm64-apple-macos12 work/aplicar.swift -o work/aplicar-arm64
+          swiftc -O -target x86_64-apple-macos12 work/aplicar.swift -o work/aplicar-x86_64
+          lipo -create work/aplicar-arm64 work/aplicar-x86_64 -output "$APP/Contents/MacOS/kyrios-papel-de-parede"
+
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleIdentifier</key><string>${PKG_ID}</string>
+            <key>CFBundleName</key><string>Kyrios Papel de Parede</string>
+            <key>CFBundleExecutable</key><string>kyrios-papel-de-parede</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${VERSAO}</string>
+            <key>CFBundleVersion</key><string>${VERSAO}</string>
+            <key>LSUIElement</key><true/>
+            <key>LSMinimumSystemVersion</key><string>12.0</string>
+          </dict></plist>
+          PLIST
+          codesign --force --sign - "$APP"
+
+          # Script de login: aplica uma vez por usuário e por versão (a pessoa pode trocar depois)
+          cat > "$ROOT$BASE/aplicar-papel-de-parede.sh" <<SH
+          #!/bin/bash
+          IMG="$IMG_DIR/kyrios-papel-de-parede.png"
+          MARCA="\$HOME/Library/Application Support/Kyrios/papel-de-parede-${VERSAO}"
+          [ -f "$BASE/papel-de-parede-fixo" ] || { [ -f "\$MARCA" ] && exit 0; }
+          sleep 3
+          "$BASE/Kyrios Papel de Parede.app/Contents/MacOS/kyrios-papel-de-parede" "\$IMG" || exit 1
+          mkdir -p "\$(dirname "\$MARCA")" && touch "\$MARCA"
+          SH
+          chmod 755 "$ROOT$BASE/aplicar-papel-de-parede.sh"
+
+          cat > "$ROOT/Library/LaunchAgents/${PKG_ID}.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>Label</key><string>${PKG_ID}</string>
+            <key>ProgramArguments</key><array>
+              <string>/bin/bash</string><string>${BASE}/aplicar-papel-de-parede.sh</string>
+            </array>
+            <key>RunAtLoad</key><true/>
+            <key>LimitLoadToSessionType</key><string>Aqua</string>
+          </dict></plist>
+          PLIST
+          chmod 644 "$ROOT/Library/LaunchAgents/${PKG_ID}.plist"
+
+          # Depois de instalar: aplica já para quem estiver logado
+          cat > scripts/postinstall <<SH
+          #!/bin/bash
+          USUARIO=\$(stat -f %Su /dev/console)
+          UID_USUARIO=\$(id -u "\$USUARIO" 2>/dev/null)
+          if [ -n "\$UID_USUARIO" ] && [ "\$UID_USUARIO" -ge 500 ]; then
+            launchctl bootout gui/\$UID_USUARIO "/Library/LaunchAgents/${PKG_ID}.plist" 2>/dev/null
+            launchctl bootstrap gui/\$UID_USUARIO "/Library/LaunchAgents/${PKG_ID}.plist" 2>/dev/null || \
+              launchctl asuser \$UID_USUARIO sudo -u "\$USUARIO" /bin/bash "${BASE}/aplicar-papel-de-parede.sh"
+          fi
+          exit 0
+          SH
+          chmod 755 scripts/postinstall
+
+          find root -type f | sed 's/^/  /'
+
+      - name: Gerar e assinar o pacote
+        env:
+          P12: ${{ secrets.DEVID_INSTALLER_P12 }}
+          SENHA: ${{ secrets.DEVID_INSTALLER_SENHA }}
+          NOME: ${{ secrets.DEVID_INSTALLER_NOME }}
+        run: |
+          mkdir -p out
+          pkgbuild --root root --scripts scripts --identifier "$PKG_ID" --version "$VERSAO" \
+            --install-location / work/componente.pkg
+          if [ -n "$P12" ]; then
+            KC="$RUNNER_TEMP/assinatura.keychain-db"
+            security create-keychain -p temp "$KC"
+            security set-keychain-settings -lut 900 "$KC"
+            security unlock-keychain -p temp "$KC"
+            echo "$P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+            security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$SENHA" -T /usr/bin/productbuild
+            security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+            productbuild --sign "$NOME" --keychain "$KC" --package work/componente.pkg out/KyriosPapelDeParede.pkg
+            rm -f "$RUNNER_TEMP/cert.p12"
+            echo "ASSINADO=sim" >> "$GITHUB_ENV"
+          else
+            echo "::warning::Sem os secrets DEVID_INSTALLER_*: pacote gerado SEM assinatura (o Apple Business não aceita)."
+            productbuild --package work/componente.pkg out/KyriosPapelDeParede.pkg
+            echo "ASSINADO=nao" >> "$GITHUB_ENV"
+          fi
+          pkgutil --check-signature out/KyriosPapelDeParede.pkg || true
+          cp work/kyrios-papel-de-parede.png out/
+
+      - name: Publicar release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHA=$(shasum -a 256 out/KyriosPapelDeParede.pkg | cut -d' ' -f1)
+          TAG="papel-de-parede-${VERSAO}"
+          {
+            echo "Pacote do papel de parede Kyrios para o Apple Business (Pacotes macOS)."
+            echo ""
+            echo "| Campo | Valor |"
+            echo "|---|---|"
+            echo "| URL | https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/KyriosPapelDeParede.pkg |"
+            echo "| SHA-256 | ${SHA} |"
+            echo "| ID do pacote | ${PKG_ID} |"
+            echo "| Versão | ${VERSAO} |"
+            echo "| Assinado | ${ASSINADO} |"
+          } > notas.md
+          cat notas.md
+          gh release create "$TAG" out/KyriosPapelDeParede.pkg out/kyrios-papel-de-parede.png \
+            --repo "$GITHUB_REPOSITORY" --title "Papel de parede ${VERSAO}" --notes-file notas.md
