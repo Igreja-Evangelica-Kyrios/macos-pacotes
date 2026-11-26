@@ -1,0 +1,54 @@
+name: Publicar pacotes macOS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  pacotes:
+    runs-on: macos-latest
+    steps:
+      - name: Baixar Google Chrome (pkg oficial)
+        run: |
+          mkdir -p out
+          curl -fsSL -o out/GoogleChrome.pkg "https://dl.google.com/dl/chrome/mac/universal/stable/gcem/GoogleChrome.pkg"
+
+      - name: Baixar Google Drive (dmg oficial) e extrair o pkg
+        run: |
+          curl -fsSL -o GoogleDrive.dmg "https://dl.google.com/drive-file-stream/GoogleDrive.dmg"
+          hdiutil attach GoogleDrive.dmg -nobrowse -mountpoint /Volumes/GDrive
+          cp "$(find /Volumes/GDrive -maxdepth 1 -name '*.pkg' | head -1)" out/GoogleDrive.pkg
+          hdiutil detach /Volumes/GDrive
+
+      - name: Ler versoes e calcular SHA-256
+        id: info
+        run: |
+          versao() {
+            rm -rf x && pkgutil --expand-full "$1" x
+            plist=$(find x -path "*$2/Contents/Info.plist" | head -1)
+            /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$plist"
+          }
+          CHROME_VER=$(versao out/GoogleChrome.pkg "Google Chrome.app")
+          DRIVE_VER=$(versao out/GoogleDrive.pkg "Google Drive.app")
+          CHROME_SHA=$(shasum -a 256 out/GoogleChrome.pkg | cut -d' ' -f1)
+          DRIVE_SHA=$(shasum -a 256 out/GoogleDrive.pkg | cut -d' ' -f1)
+          TAG="pacotes-$(date +%Y%m%d-%H%M)"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          {
+            echo "Pacotes para o Apple Business (Pacotes macOS)."
+            echo ""
+            echo "| Pacote | ID | Versao | SHA-256 |"
+            echo "|---|---|---|---|"
+            echo "| GoogleChrome.pkg | com.google.Chrome | $CHROME_VER | $CHROME_SHA |"
+            echo "| GoogleDrive.pkg | com.google.drivefs | $DRIVE_VER | $DRIVE_SHA |"
+          } > notas.md
+          cat notas.md
+
+      - name: Publicar release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.info.outputs.tag }}" out/GoogleChrome.pkg out/GoogleDrive.pkg \
+            --repo "$GITHUB_REPOSITORY" --title "${{ steps.info.outputs.tag }}" --notes-file notas.md
