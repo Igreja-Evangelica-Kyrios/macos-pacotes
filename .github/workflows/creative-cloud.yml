@@ -1,0 +1,135 @@
+name: Pacote Adobe Creative Cloud
+
+# Monta o pacote que instala o app Adobe Creative Cloud nos Macs da Multimídia.
+# Cada pessoa entra com a própria conta Adobe e instala Premiere Pro, Illustrator,
+# Photoshop e Lightroom pelo Creative Cloud (as licenças são individuais).
+#
+# O pacote é pequeno: na hora da instalação ele baixa o instalador oficial da Adobe
+# (Intel ou Apple Silicon), confere o SHA-256 e a assinatura da Adobe e instala em silêncio.
+# Assinado com o Developer ID Installer da igreja (mesmos secrets do papel de parede).
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  pacote:
+    runs-on: macos-latest
+    env:
+      PKG_ID: com.igrejakyrios.creativecloud
+      BASE: /Library/Application Support/Kyrios
+      ADOBE_TEAM: JQ525L2MZD
+    steps:
+      - name: Descobrir a versão atual do Creative Cloud
+        run: |
+          mkdir -p work
+          curl -fsSL https://formulae.brew.sh/api/cask/adobe-creative-cloud.json -o work/cask.json
+          python3 - <<'PY'
+          import json, re, os
+          d = json.load(open("work/cask.json"))
+          urls = set(re.findall(r'https://ccmdls\.adobe\.com/[^"\s]+?\.dmg', json.dumps(d)))
+          arm = next((u for u in urls if "/macarm64/" in u), None)
+          intel = next((u for u in urls if "/osx10/" in u), None)
+          if arm and not intel: intel = arm.replace("/macarm64/", "/osx10/")
+          if intel and not arm: arm = intel.replace("/osx10/", "/macarm64/")
+          if not arm: raise SystemExit("Não achei a URL do instalador da Adobe")
+          versao = d["version"].split(",")[0]
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"URL_ARM={arm}\nURL_INTEL={intel}\nCC_VERSAO={versao}\n")
+          print("Versão:", versao); print("ARM:", arm); print("Intel:", intel)
+          PY
+
+      - name: Baixar e conferir os instaladores da Adobe
+        run: |
+          for A in ARM INTEL; do
+            URL_VAR="URL_$A"; URL="${!URL_VAR}"
+            curl -fL --retry 3 -o "work/cc-$A.dmg" "$URL"
+            SHA=$(shasum -a 256 "work/cc-$A.dmg" | cut -d' ' -f1)
+            MNT=$(mktemp -d)
+            hdiutil attach -nobrowse -readonly -mountpoint "$MNT" "work/cc-$A.dmg" >/dev/null
+            test -x "$MNT/Install.app/Contents/MacOS/Install" || { echo "Install.app não encontrado ($A)"; exit 1; }
+            codesign --verify --deep --strict "$MNT/Install.app"
+            codesign -dv "$MNT/Install.app" 2>&1 | grep -q "TeamIdentifier=$ADOBE_TEAM" || { echo "Assinatura não é da Adobe ($A)"; exit 1; }
+            hdiutil detach "$MNT" -force >/dev/null
+            echo "SHA_$A=$SHA" >> "$GITHUB_ENV"
+            echo "$A: $SHA ($(du -h "work/cc-$A.dmg" | cut -f1))"
+          done
+
+      - name: Montar o conteúdo do pacote
+        run: |
+          VERSAO="${CC_VERSAO}.${GITHUB_RUN_NUMBER}"
+          echo "VERSAO=$VERSAO" >> "$GITHUB_ENV"
+          mkdir -p "root$BASE" scripts
+          printf 'Instalador do Adobe Creative Cloud (Kyrios)\nVersão: %s\n' "$VERSAO" > "root$BASE/creative-cloud-instalador.txt"
+
+          cat > scripts/postinstall <<SH
+          #!/bin/bash
+          # Instala o Adobe Creative Cloud (app oficial da Adobe) em silêncio.
+          LOG=/var/log/kyrios-creative-cloud.log
+          exec >>"\$LOG" 2>&1
+          echo "== \$(date) =="
+          if [ -d "/Applications/Utilities/Adobe Creative Cloud/ACC/Creative Cloud.app" ]; then
+            echo "Creative Cloud já instalado"; exit 0
+          fi
+          if [ "\$(uname -m)" = "arm64" ]; then URL="$URL_ARM"; SHA="$SHA_ARM"; else URL="$URL_INTEL"; SHA="$SHA_INTEL"; fi
+          TMP=\$(mktemp -d)
+          curl -fL --retry 5 --retry-delay 10 -o "\$TMP/cc.dmg" "\$URL" || { echo "Falha no download"; exit 1; }
+          echo "\$SHA  \$TMP/cc.dmg" | shasum -a 256 -c || { echo "SHA-256 diferente"; rm -rf "\$TMP"; exit 1; }
+          MNT="\$TMP/mnt"; mkdir -p "\$MNT"
+          hdiutil attach -nobrowse -readonly -mountpoint "\$MNT" "\$TMP/cc.dmg" || exit 1
+          if codesign -dv "\$MNT/Install.app" 2>&1 | grep -q "TeamIdentifier=$ADOBE_TEAM"; then
+            "\$MNT/Install.app/Contents/MacOS/Install" --mode=silent
+            RC=\$?
+          else
+            echo "Assinatura da Adobe inválida"; RC=1
+          fi
+          hdiutil detach "\$MNT" -force
+          rm -rf "\$TMP"
+          echo "Resultado: \$RC"
+          exit \$RC
+          SH
+          chmod 755 scripts/postinstall
+          cat scripts/postinstall
+
+      - name: Gerar e assinar o pacote
+        env:
+          P12: ${{ secrets.DEVID_INSTALLER_P12 }}
+          SENHA: ${{ secrets.DEVID_INSTALLER_SENHA }}
+          NOME: ${{ secrets.DEVID_INSTALLER_NOME }}
+        run: |
+          mkdir -p out
+          pkgbuild --root root --scripts scripts --identifier "$PKG_ID" --version "$VERSAO" \
+            --install-location / work/componente.pkg
+          KC="$RUNNER_TEMP/assinatura.keychain-db"
+          security create-keychain -p temp "$KC"
+          security set-keychain-settings -lut 900 "$KC"
+          security unlock-keychain -p temp "$KC"
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$SENHA" -T /usr/bin/productbuild
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          productbuild --sign "$NOME" --keychain "$KC" --package work/componente.pkg out/KyriosCreativeCloud.pkg
+          rm -f "$RUNNER_TEMP/cert.p12"
+          pkgutil --check-signature out/KyriosCreativeCloud.pkg
+
+      - name: Publicar release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHA=$(shasum -a 256 out/KyriosCreativeCloud.pkg | cut -d' ' -f1)
+          TAG="creative-cloud-${VERSAO}"
+          {
+            echo "Pacote do Adobe Creative Cloud para o Apple Business (Pacotes macOS) — Macs da Multimídia."
+            echo ""
+            echo "| Campo | Valor |"
+            echo "|---|---|"
+            echo "| URL | https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/KyriosCreativeCloud.pkg |"
+            echo "| SHA-256 | ${SHA} |"
+            echo "| ID do pacote | ${PKG_ID} |"
+            echo "| Versão | ${VERSAO} |"
+            echo "| Creative Cloud | ${CC_VERSAO} |"
+          } > notas.md
+          cat notas.md
+          gh release create "$TAG" out/KyriosCreativeCloud.pkg \
+            --repo "$GITHUB_REPOSITORY" --title "Creative Cloud ${VERSAO}" --notes-file notas.md
