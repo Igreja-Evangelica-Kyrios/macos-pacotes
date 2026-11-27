@@ -1,0 +1,122 @@
+name: Pacote Google Drive
+
+# Monta o pacote do Google Drive para o Apple Business.
+# O pkg oficial do Google escolhe Intel ou Apple Silicon por um script que o
+# gerenciamento da Apple não respeita (Macs Intel recebiam a versão Apple Silicon).
+# Este pacote é pequeno: na instalação baixa o instalador oficial do Google,
+# confere a assinatura do Google e roda o "installer" no próprio Mac,
+# que escolhe a versão certa para o processador.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  pacote:
+    runs-on: macos-latest
+    env:
+      PKG_ID: com.google.drivefs
+      BASE: /Library/Application Support/Kyrios
+      GOOGLE_TEAM: EQHXZ8M8AV
+      DRIVE_URL: https://dl.google.com/drive-file-stream/GoogleDrive.dmg
+    steps:
+      - name: Conferir o instalador do Google e ler a versão
+        run: |
+          mkdir -p work
+          curl -fsSL -o work/GoogleDrive.dmg "$DRIVE_URL"
+          MNT=$(mktemp -d)
+          hdiutil attach -nobrowse -readonly -mountpoint "$MNT" work/GoogleDrive.dmg >/dev/null
+          PKG=$(find "$MNT" -maxdepth 1 -name '*.pkg' | head -1)
+          pkgutil --check-signature "$PKG" | tee work/assinatura.txt
+          grep -q "($GOOGLE_TEAM)" work/assinatura.txt || { echo "Assinatura não é do Google"; exit 1; }
+          rm -rf x && pkgutil --expand-full "$PKG" x
+          PLIST=$(find x -path "*Google Drive.app/Contents/Info.plist" | head -1)
+          DRIVE_VER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$PLIST")
+          hdiutil detach "$MNT" -force >/dev/null
+          echo "DRIVE_VER=$DRIVE_VER" >> "$GITHUB_ENV"
+          echo "Google Drive $DRIVE_VER"
+
+      - name: Montar o conteúdo do pacote
+        run: |
+          VERSAO="${DRIVE_VER}.${GITHUB_RUN_NUMBER}"
+          echo "VERSAO=$VERSAO" >> "$GITHUB_ENV"
+          mkdir -p "root$BASE" scripts
+          printf 'Instalador do Google Drive (Kyrios)\nVersão: %s\n' "$VERSAO" > "root$BASE/google-drive-instalador.txt"
+
+          cat > scripts/postinstall <<SH
+          #!/bin/bash
+          # Instala o Google Drive oficial com a versão certa para o processador deste Mac.
+          LOG=/var/log/kyrios-google-drive.log
+          exec >>"\$LOG" 2>&1
+          echo "== \$(date) =="
+          APP="/Applications/Google Drive.app"
+          BIN="\$APP/Contents/MacOS/Google Drive"
+          ARCH=\$(uname -m)
+          if [ -x "\$BIN" ] && lipo -archs "\$BIN" 2>/dev/null | grep -qw "\$ARCH"; then
+            echo "Google Drive já instalado para \$ARCH"; exit 0
+          fi
+          if [ -d "\$APP" ]; then
+            echo "Removendo Google Drive incompatível com \$ARCH"
+            pkill -x "Google Drive" 2>/dev/null
+            rm -rf "\$APP"
+          fi
+          TMP=\$(mktemp -d)
+          curl -fL --retry 5 --retry-delay 10 -o "\$TMP/GoogleDrive.dmg" "$DRIVE_URL" || { echo "Falha no download"; exit 1; }
+          MNT="\$TMP/mnt"; mkdir -p "\$MNT"
+          hdiutil attach -nobrowse -readonly -mountpoint "\$MNT" "\$TMP/GoogleDrive.dmg" || exit 1
+          PKG=\$(find "\$MNT" -maxdepth 1 -name '*.pkg' | head -1)
+          if pkgutil --check-signature "\$PKG" | grep -q "($GOOGLE_TEAM)"; then
+            installer -pkg "\$PKG" -target /
+            RC=\$?
+          else
+            echo "Assinatura do Google inválida"; RC=1
+          fi
+          hdiutil detach "\$MNT" -force
+          rm -rf "\$TMP"
+          echo "Resultado: \$RC"
+          exit \$RC
+          SH
+          chmod 755 scripts/postinstall
+          cat scripts/postinstall
+
+      - name: Gerar e assinar o pacote
+        env:
+          P12: ${{ secrets.DEVID_INSTALLER_P12 }}
+          SENHA: ${{ secrets.DEVID_INSTALLER_SENHA }}
+          NOME: ${{ secrets.DEVID_INSTALLER_NOME }}
+        run: |
+          mkdir -p out
+          pkgbuild --root root --scripts scripts --identifier "com.igrejakyrios.googledrive" --version "$VERSAO" \
+            --install-location / work/componente.pkg
+          KC="$RUNNER_TEMP/assinatura.keychain-db"
+          security create-keychain -p temp "$KC"
+          security set-keychain-settings -lut 900 "$KC"
+          security unlock-keychain -p temp "$KC"
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$SENHA" -T /usr/bin/productbuild
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          productbuild --sign "$NOME" --keychain "$KC" --package work/componente.pkg out/KyriosGoogleDrive.pkg
+          rm -f "$RUNNER_TEMP/cert.p12"
+          pkgutil --check-signature out/KyriosGoogleDrive.pkg
+
+      - name: Publicar release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHA=$(shasum -a 256 out/KyriosGoogleDrive.pkg | cut -d' ' -f1)
+          TAG="google-drive-${VERSAO}"
+          {
+            echo "Pacote do Google Drive para o Apple Business (Pacotes macOS) — Intel e Apple Silicon."
+            echo ""
+            echo "| Campo | Valor |"
+            echo "|---|---|"
+            echo "| URL | https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/KyriosGoogleDrive.pkg |"
+            echo "| SHA-256 | ${SHA} |"
+            echo "| ID do pacote | ${PKG_ID} |"
+            echo "| Versão (Google Drive) | ${DRIVE_VER} |"
+          } > notas.md
+          cat notas.md
+          gh release create "$TAG" out/KyriosGoogleDrive.pkg \
+            --repo "$GITHUB_REPOSITORY" --title "Google Drive ${VERSAO}" --notes-file notas.md
