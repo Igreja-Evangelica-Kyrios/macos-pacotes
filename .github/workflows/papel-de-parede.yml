@@ -38,6 +38,30 @@ jobs:
           file work/kyrios-papel-de-parede.png | grep -q "PNG image data" || { echo "O link não é um PNG"; exit 1; }
           sips -g pixelWidth -g pixelHeight work/kyrios-papel-de-parede.png
 
+      - name: Deixar a imagem segura para qualquer tela (16:10)
+        run: |
+          # O papel de parede travado preenche a tela inteira. Uma arte 16:9 corta as laterais
+          # nos MacBooks (16:10). Aqui a imagem vira 16:10 espelhando a borda de cima e de baixo:
+          # em telas 16:10 aparece inteira; em telas 16:9 só some essa faixa extra.
+          python3 -m pip install --quiet --break-system-packages pillow || python3 -m pip install --quiet pillow
+          python3 - <<'PY'
+          from PIL import Image, ImageOps
+          f = "work/kyrios-papel-de-parede.png"
+          im = Image.open(f).convert("RGB")
+          W, H = im.size
+          alvo = round(W / 1.6)
+          if alvo > H:
+              P1 = (alvo - H) // 2; P2 = alvo - H - P1
+              out = Image.new("RGB", (W, alvo))
+              out.paste(im, (0, P1))
+              out.paste(ImageOps.flip(im.crop((0, 0, W, P1))), (0, 0))
+              out.paste(ImageOps.flip(im.crop((0, H - P2, W, H))), (0, H + P1))
+              out.save(f, optimize=True)
+              print(f"Ajustada de {W}x{H} para {W}x{alvo}")
+          else:
+              print(f"Imagem {W}x{H} já serve")
+          PY
+
       - name: Montar o conteúdo do pacote
         run: |
           VERSAO="1.0.${GITHUB_RUN_NUMBER}"
